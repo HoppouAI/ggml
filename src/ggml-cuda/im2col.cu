@@ -44,6 +44,100 @@ static  __global__ void im2col_kernel(
     }
 }
 
+#define IM2COL_1D_TW 64
+#define IM2COL_1D_CB 32
+
+// 1d im2col through a shared memory tile, reads coalesce along time and writes along the output row
+template <typename T, int KW_T>
+static __global__ void im2col_1d_tiled_kernel(
+        const float * x, T * dst, int64_t IC, int64_t IW, int64_t OW, int KW_rt,
+        int64_t ch_stride, int64_t batch_stride, int s0, int p0, int d0, int tw_in) {
+    extern __shared__ float tile[];
+    const int KW = KW_T > 0 ? KW_T : KW_rt;
+    const int64_t ow0 = (int64_t) blockIdx.x * IM2COL_1D_TW;
+    const int64_t ic0 = (int64_t) blockIdx.y * IM2COL_1D_CB;
+    const int64_t n   = blockIdx.z;
+    const int64_t iw0 = ow0 * s0 - p0;
+    const float * xn  = x + n * batch_stride;
+
+    for (int i = threadIdx.x; i < IM2COL_1D_CB * tw_in; i += blockDim.x) {
+        const int     c  = i / tw_in;
+        const int     j  = i - c * tw_in;
+        const int64_t ic = ic0 + c;
+        const int64_t iw = iw0 + j;
+        tile[i] = (ic < IC && iw >= 0 && iw < IW) ? xn[ic * ch_stride + iw] : 0.0f;
+    }
+    __syncthreads();
+
+    const int     cbk    = IM2COL_1D_CB * KW;
+    const int64_t rowlen = IC * KW;
+    if constexpr (std::is_same_v<T, half>) {
+        // half2 stores, a full channel block keeps every row segment 4 byte aligned
+        if (ic0 + IM2COL_1D_CB <= IC && (rowlen & 1) == 0) {
+            const int pairs = cbk / 2;
+            for (int i = threadIdx.x; i < IM2COL_1D_TW * pairs; i += blockDim.x) {
+                const int     o  = i / pairs;
+                const int     e  = (i - o * pairs) * 2;
+                const int64_t ow = ow0 + o;
+                if (ow >= OW) {
+                    continue;
+                }
+                const int c0 = e / KW, k0 = e - c0 * KW;
+                const int c1 = (e + 1) / KW, k1 = e + 1 - c1 * KW;
+                const float * t = tile + o * s0;
+                half2 v = __floats2half2_rn(t[c0 * tw_in + k0 * d0], t[c1 * tw_in + k1 * d0]);
+                *(half2 *) (dst + (n * OW + ow) * rowlen + ic0 * KW + e) = v;
+            }
+            return;
+        }
+    }
+    for (int i = threadIdx.x; i < IM2COL_1D_TW * cbk; i += blockDim.x) {
+        const int     o  = i / cbk;
+        const int     r  = i - o * cbk;
+        const int     c  = r / KW;
+        const int     k  = r - c * KW;
+        const int64_t ow = ow0 + o;
+        const int64_t ic = ic0 + c;
+        if (ow < OW && ic < IC) {
+            dst[(n * OW + ow) * rowlen + ic * KW + k] = tile[c * tw_in + o * s0 + k * d0];
+        }
+    }
+}
+
+template <typename T>
+static bool im2col_1d_tiled_cuda(const float * x, T * dst, int64_t IW, int64_t OW, int64_t KW, int64_t IC, int64_t N,
+                                 int64_t ch_stride, int64_t batch_stride, int s0, int p0, int d0, cudaStream_t stream) {
+    const int64_t tw_in = (int64_t) (IM2COL_1D_TW - 1) * s0 + (KW - 1) * d0 + 1;
+    const size_t  smem  = (size_t) IM2COL_1D_CB * tw_in * sizeof(float);
+    if (smem > 48 * 1024 || N > MAX_GRIDDIM_Z || KW > 4096) {
+        return false;
+    }
+    dim3 grid((OW + IM2COL_1D_TW - 1) / IM2COL_1D_TW, (IC + IM2COL_1D_CB - 1) / IM2COL_1D_CB, N);
+    switch (KW) {
+        case 1:
+            im2col_1d_tiled_kernel<T, 1><<<grid, 256, smem, stream>>>(x, dst, IC, IW, OW, 1, ch_stride, batch_stride, s0,
+                                                                      p0, d0, (int) tw_in);
+            break;
+        case 7:
+            im2col_1d_tiled_kernel<T, 7><<<grid, 256, smem, stream>>>(x, dst, IC, IW, OW, 7, ch_stride, batch_stride, s0,
+                                                                      p0, d0, (int) tw_in);
+            break;
+        default:
+            im2col_1d_tiled_kernel<T, 0><<<grid, 256, smem, stream>>>(x, dst, IC, IW, OW, (int) KW, ch_stride,
+                                                                      batch_stride, s0, p0, d0, (int) tw_in);
+            break;
+    }
+    return true;
+}
+
+static bool im2col_legacy() {
+    static const bool legacy = [] {
+        const char * v = getenv("GGML_CUDA_CONV1D_LEGACY");
+        return v && v[0] && v[0] != '0';
+    }();
+    return legacy;
+}
+
 // im2col: [N, IC, IH, IW] => [N, OH, OW, IC*KH*KW]
 template <typename T>
 static void im2col_cuda(const float * x, T* dst,
@@ -110,6 +204,15 @@ void ggml_cuda_op_im2col(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int64_t IC_IH_IW = src1->nb[is_2D ? 2 : 1] / 4; // nb is byte offset, src is type float32
     const int64_t N        = src1->ne[is_2D ? 3 : 2];
     const int64_t IH_IW    = src1->nb[is_2D ? 3 : 2] / 4; // nb is byte offset, src is type float32
+
+    if (!is_2D && !im2col_legacy()) {
+        const bool done = dst->type == GGML_TYPE_F16 ?
+            im2col_1d_tiled_cuda(src1_d, (half *) dst_d, IW, OW, KW, IC, N, IC_IH_IW, IH_IW, s0, p0, d0, stream) :
+            im2col_1d_tiled_cuda(src1_d, (float *) dst_d, IW, OW, KW, IC, N, IC_IH_IW, IH_IW, s0, p0, d0, stream);
+        if (done) {
+            return;
+        }
+    }
 
     if(dst->type == GGML_TYPE_F16) {
         im2col_cuda_f16(src1_d, (half *) dst_d, IW, IH, OW, OH, KW, KH, IC, N, IC_IH_IW, IH_IW, s0, s1, p0, p1, d0, d1, stream);
